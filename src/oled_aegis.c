@@ -175,6 +175,28 @@ static MonitorState g_monitorStates[MAX_MONITOR_COUNT];
 static UINT g_uTaskbarRestart = 0;  // Registered "TaskbarCreated" message ID (0 if not registered)
 static int g_mediaCacheInvalidated = 0;  // Set by WM_POWERBROADCAST to force media cache refresh
 
+int ClampInt(int value, int minValue, int maxValue) {
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+void ClampConfigValues() {
+    g_app.config.idleTimeout = ClampInt(g_app.config.idleTimeout, MIN_IDLE_TIMEOUT_SEC, MAX_IDLE_TIMEOUT_SEC);
+    g_app.config.checkInterval = ClampInt(g_app.config.checkInterval, MIN_CHECK_INTERVAL_MS, MAX_CHECK_INTERVAL_MS);
+    g_app.config.pixelShiftCompensation = ClampInt(
+        g_app.config.pixelShiftCompensation,
+        MIN_PIXEL_SHIFT_COMPENSATION,
+        MAX_PIXEL_SHIFT_COMPENSATION
+    );
+
+    g_app.config.mediaDetectionEnabled = g_app.config.mediaDetectionEnabled ? 1 : 0;
+    g_app.config.startupEnabled = g_app.config.startupEnabled ? 1 : 0;
+    g_app.config.debugMode = g_app.config.debugMode ? 1 : 0;
+    g_app.config.perMonitorInputDetection = g_app.config.perMonitorInputDetection ? 1 : 0;
+    g_app.config.perMonitorMediaDetection = g_app.config.perMonitorMediaDetection ? 1 : 0;
+}
+
 int IsAppUiActive() {
     return g_app.trayMenuActive;
 }
@@ -667,6 +689,8 @@ void LoadConfig() {
                       primaryIdx, g_monitors[primaryIdx].friendlyName);
         }
     }
+
+    ClampConfigValues();
 }
 
 void SaveConfig() {
@@ -2002,10 +2026,7 @@ void ApplySettings(HWND hWnd) {
 
     GetDlgItemTextA(hWnd, IDC_INTERVAL_EDIT, buffer, 32);
     int oldInterval = g_app.config.checkInterval;
-    int newInterval = atoi(buffer);
-    if (newInterval < MIN_CHECK_INTERVAL_MS) newInterval = MIN_CHECK_INTERVAL_MS;
-    if (newInterval > MAX_CHECK_INTERVAL_MS) newInterval = MAX_CHECK_INTERVAL_MS;
-    g_app.config.checkInterval = newInterval;
+    g_app.config.checkInterval = atoi(buffer);
 
     int oldMedia = g_app.config.mediaDetectionEnabled;
     int oldDebug = g_app.config.debugMode;
@@ -2020,10 +2041,8 @@ void ApplySettings(HWND hWnd) {
     g_app.config.perMonitorMediaDetection = IsDlgButtonChecked(hWnd, IDC_PERMONITOR_MEDIA_CHECK) == BST_CHECKED;
 
     GetDlgItemTextA(hWnd, IDC_PIXELSHIFT_EDIT, buffer, 32);
-    int newPixelShift = atoi(buffer);
-    if (newPixelShift < MIN_PIXEL_SHIFT_COMPENSATION) newPixelShift = MIN_PIXEL_SHIFT_COMPENSATION;
-    if (newPixelShift > MAX_PIXEL_SHIFT_COMPENSATION) newPixelShift = MAX_PIXEL_SHIFT_COMPENSATION;
-    g_app.config.pixelShiftCompensation = newPixelShift;
+    g_app.config.pixelShiftCompensation = atoi(buffer);
+    ClampConfigValues();
 
     for (int i = 0; i < g_monitorCount; i++) {
         int wasEnabled = g_app.config.monitorsEnabled[i];
