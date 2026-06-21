@@ -104,6 +104,7 @@ int FindPrimaryMonitorIndex();
 int IsAnyMonitorEnabled();
 int GetProcessNameFromHwnd(HWND hWnd, char* buffer, int bufferSize);
 int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]);
+void ResetMediaDetectionCache();
 
 typedef struct {
     HMONITOR hMonitor;
@@ -164,6 +165,7 @@ static int g_currentMonitorIndex = 0;
 static MonitorInfo g_monitors[MAX_MONITOR_COUNT];
 static MonitorState g_monitorStates[MAX_MONITOR_COUNT];
 static UINT g_uTaskbarRestart = 0;  // Registered "TaskbarCreated" message ID (0 if not registered)
+static int g_mediaCacheInvalidated = 0;  // Set by WM_POWERBROADCAST to force media cache refresh
 
 int ScaleDPI(int value) {
     return MulDiv(value, g_settingsDpi, 96);
@@ -893,7 +895,9 @@ int WindowTitleHasMediaHint(const char* title) {
         "Emby",
         "Media Player",
         "VLC media player",
-        "Picture in picture"
+        "Picture in picture",
+        "TikTok",
+        "/ X"           // For x.com titles are "Home / X", "@user / X", "user on X: ... / X"
     };
 
     if (!title || title[0] == '\0') return 0;
@@ -981,6 +985,23 @@ int IsAudioActiveProcessName(const MediaEnumContext* ctx, const char* processNam
         }
     }
     return 0;
+}
+
+// Returns 1 if every audio-active process is a known browser. Used to decide
+// whether to skip the block-all fallback: when a browser has active audio but
+// no window title matches a video hint (e.g. video in a background tab), we
+// can't determine which monitor is playing. For browsers, not blocking is
+// preferable to blocking everything, since the user's use case is to let the
+// OLED sleep when video plays elsewhere. For non-browser apps (unknown apps,
+// media players with minimized windows), we keep the safe block-all fallback.
+int AllAudioActiveAreBrowsers(const MediaEnumContext* ctx) {
+    if (ctx->audioActiveProcessNameCount == 0) return 0;
+    for (int i = 0; i < ctx->audioActiveProcessNameCount; i++) {
+        if (!IsKnownBrowserProcess(ctx->audioActiveProcessNames[i])) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 // Collect exe names of processes with an ACTIVE audio session on the default
@@ -1156,7 +1177,7 @@ BOOL CALLBACK EnumMediaWindowCallback(HWND hWnd, LPARAM lParam) {
     // A window only counts as media if its process is actually emitting audio.
     // We match by exe name (not PID) because Chromium browsers run multi-process:
     // the audio session belongs to the renderer process, while the window belongs
-    // to the main process — both share the same exe name. This also handles
+    // to the main process both share the same exe name. This also handles
     // single-process players (VLC, mpv) where name match == PID match.
     if (!IsAudioActiveProcessName(ctx, processName)) {
         return TRUE;
@@ -1166,11 +1187,22 @@ BOOL CALLBACK EnumMediaWindowCallback(HWND hWnd, LPARAM lParam) {
     GetWindowTextA(hWnd, title, sizeof(title));
 
     if (!IsMediaCandidateWindow(processName, title)) {
+        // Log browser windows that have active audio but didn't match any video
+        // title hint. This helps identify sites that need hints added.
+        if (IsKnownBrowserProcess(processName) && title[0]) {
+            LogMessage("Media detection: browser with active audio but no title hint: '%.80s'", title);
+        }
         return TRUE;
     }
 
     MarkMediaWindowMonitors(ctx, &rect);
     return TRUE;
+}
+
+// Reset media detection cache. Called after system sleep/wake to force a fresh
+// scan, since WASAPI sessions and ES_DISPLAY_REQUIRED state may be stale.
+void ResetMediaDetectionCache() {
+    g_mediaCacheInvalidated = 1;
 }
 
 // Fills mediaOnMonitor[] with 1 for each monitor hosting a visible media window.
@@ -1188,6 +1220,13 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
 
     for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
         mediaOnMonitor[i] = 0;
+    }
+
+    if (g_mediaCacheInvalidated) {
+        hasCachedState = 0;
+        lastLoggedMask = (DWORD)-1;
+        g_mediaCacheInvalidated = 0;
+        LogMessage("Media detection cache invalidated (sleep/wake)");
     }
 
     if (!g_app.config.mediaDetectionEnabled) {
@@ -1241,18 +1280,30 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
     }
 
     int usedGlobalFallback = 0;
+    int skippedFallbackForBrowser = 0;
     if (mappedMonitorCount == 0) {
-        // Windows reports media playback but no candidate window with active
-        // audio maps to a monitor (muted video / unknown app / audio routed to
-        // a non-default device / minimized player). Conservatively block all
-        // enabled monitors to avoid covering playback. This matches the prior
-        // global behavior, so there is no regression for muted-video cases.
-        for (int i = 0; i < g_monitorCount; i++) {
-            if (g_monitorStates[i].enabled) {
-                mediaOnMonitor[i] = 1;
+        // No candidate window with active audio mapped to any monitor.
+        if (AllAudioActiveAreBrowsers(&ctx)) {
+            // All audio-active processes are known browsers, but no window title
+            // matched a video hint. This typically means video is playing in a
+            // background tab - the window title shows the active tab, not the
+            // playing one. We can't determine which monitor is playing, so
+            // rather than blocking all monitors (which would defeat per-monitor
+            // detection), we skip the fallback and let the screen saver activate.
+            // The user can always move the mouse to dismiss it if needed.
+            skippedFallbackForBrowser = 1;
+            LogMessage("Media detection: no title hint match, all audio-active processes are browsers: skipping fallback");
+        } else {
+            // Non-browser audio (unknown app, media player with minimized window,
+            // muted video, audio on non-default device). Conservatively block all
+            // enabled monitors to avoid covering playback.
+            for (int i = 0; i < g_monitorCount; i++) {
+                if (g_monitorStates[i].enabled) {
+                    mediaOnMonitor[i] = 1;
+                }
             }
+            usedGlobalFallback = 1;
         }
-        usedGlobalFallback = 1;
     }
 
     DWORD mask = 0;
@@ -1269,8 +1320,8 @@ int UpdateMediaMonitorStates(int mediaOnMonitor[MAX_MONITOR_COUNT]) {
     }
 
     if (mask != lastLoggedMask) {
-        LogMessage("Media monitor detection: mask=0x%08X (activeAudioNames=%d, fallback=%d)",
-                   mask, ctx.audioActiveProcessNameCount, usedGlobalFallback);
+        LogMessage("Media monitor detection: mask=0x%08X (activeAudioNames=%d, fallback=%d, browserSkip=%d)",
+                   mask, ctx.audioActiveProcessNameCount, usedGlobalFallback, skippedFallbackForBrowser);
         lastLoggedMask = mask;
     }
 
@@ -1943,6 +1994,309 @@ void UpdateTrayIcon(int active) {
     Shell_NotifyIconA(NIM_MODIFY, (PNOTIFYICONDATAA)&g_app.nid);
 }
 
+// Handle WM_CREATE: initialize application state, tray icon, config, monitors,
+// and the idle-check timer. Returns 0 on success, -1 to abort window creation
+// (used when another instance is already running).
+int HandleCreation(HWND hWnd) {
+    memset(&g_app, 0, sizeof(g_app));
+    g_app.hWnd = hWnd;
+    g_app.isShuttingDown = 0;
+
+    g_hInstanceMutex = CreateMutexW(NULL, TRUE, L"OLEDAegis_SingleInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(NULL, L"OLED Aegis is already running", L"OLED Aegis", MB_OK | MB_ICONINFORMATION);
+        if (g_hInstanceMutex) {
+            CloseHandle(g_hInstanceMutex);
+            g_hInstanceMutex = NULL;
+        }
+        PostQuitMessage(0);
+        return -1;
+    }
+    // Keep mutex handle open for app lifetime to maintain single-instance lock
+
+    LoadTrayIcons();
+
+    g_app.nid.cbSize = sizeof(NOTIFYICONDATAA);
+    g_app.nid.hWnd = hWnd;
+    g_app.nid.uID = 1;
+    g_app.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_app.nid.uCallbackMessage = WM_TRAYICON;
+    g_app.nid.hIcon = g_hIconInactive;
+    lstrcpyA(g_app.nid.szTip, "OLED Aegis - Idle");
+    Shell_NotifyIconA(NIM_ADD, &g_app.nid);
+
+    g_app.config.idleTimeout = DEFAULT_IDLE_TIMEOUT;
+    g_app.config.checkInterval = 1000;
+    g_app.config.mediaDetectionEnabled = 1;
+    g_app.config.startupEnabled = 0;
+    g_app.config.debugMode = 0;
+    g_app.config.perMonitorInputDetection = 0;
+    g_app.config.perMonitorMediaDetection = 1;
+    for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
+        g_app.config.monitorsEnabled[i] = 1;
+    }
+
+    EnumerateMonitors();
+
+    for (int i = 0; i < g_monitorCount; i++) {
+        g_monitorStates[i].lastInputTime = time(NULL);
+        g_monitorStates[i].screenSaverActive = 0;
+        g_monitorStates[i].enabled = g_app.config.monitorsEnabled[i];
+    }
+
+    if (!ConfigFileExists()) {
+        SaveConfig();
+    }
+
+    LoadConfig();
+
+    for (int i = 0; i < g_monitorCount; i++) {
+        g_monitorStates[i].enabled = g_app.config.monitorsEnabled[i];
+    }
+
+    UpdateStartupRegistry();
+
+    LogMessage("Application started. Timeout: %ds, Media: %d, Debug: %d",
+             g_app.config.idleTimeout, g_app.config.mediaDetectionEnabled, g_app.config.debugMode);
+
+    g_blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = MonitorWindowProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.hbrBackground = g_blackBrush;
+    wc.lpszClassName = L"OLEDAegisScreen";
+    RegisterClassW(&wc);
+
+    SetTimer(hWnd, TIMER_IDLE_CHECK, g_app.config.checkInterval, NULL);
+
+    return 0;
+}
+
+void HandleTimeout(WPARAM wParam) {
+    if (wParam != TIMER_IDLE_CHECK) {
+        return;
+    }
+
+    // Skip all processing if no monitors have screen saver enabled
+    if (!IsAnyMonitorEnabled()) {
+        return;
+    }
+
+    // Per-monitor input detection mode:
+    //   Each monitor has its own idle timer, updated by tracking cursor position
+    //   and focused-window location. This lets the screen saver activate on
+    //   unused monitors while the user continues working on others. Media is
+    //   checked per-monitor (if perMonitorMediaDetection is on) or globally.
+    //   Each monitor's screen saver is activated/deactivated independently.
+    if (g_app.config.perMonitorInputDetection) {
+        DWORD idleTime = GetIdleTime();
+        time_t now = time(NULL);
+
+        int usePerMonitorMedia = (g_app.config.perMonitorMediaDetection && g_app.config.mediaDetectionEnabled);
+        int mediaOnMonitor[MAX_MONITOR_COUNT] = {0};
+        int mediaPlaying = 0;
+        if (usePerMonitorMedia) {
+            UpdateMediaMonitorStates(mediaOnMonitor);
+        } else {
+            mediaPlaying = IsMediaPlaying();
+        }
+
+        int inManualCooldown = 0;
+        if (g_app.isManualActivation) {
+            DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
+            if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
+                inManualCooldown = 1;
+            } else {
+                g_app.isManualActivation = 0;
+                g_app.manualActivationTime = 0;
+            }
+        }
+
+        if (idleTime < IDLE_ACTIVITY_THRESHOLD_MS && !inManualCooldown) {
+            POINT pt;
+            GetCursorPos(&pt);
+            int cursorMonitorIndex = GetMonitorIndexFromPoint(pt);
+
+            if (cursorMonitorIndex >= 0 && cursorMonitorIndex < g_monitorCount) {
+                g_monitorStates[cursorMonitorIndex].lastInputTime = now;
+            }
+
+            HWND hFg = GetForegroundWindow();
+            if (hFg) {
+                int isOledWindow = 0;
+                for (int i = 0; i < g_monitorCount; i++) {
+                    if (g_monitorStates[i].hScreenSaverWnd == hFg) {
+                        isOledWindow = 1;
+                        break;
+                    }
+                }
+
+                if (!isOledWindow) {
+                    RECT rect;
+                    GetWindowRect(hFg, &rect);
+                    int fgMonitorIndex = GetMonitorIndexFromRect(rect);
+                    if (fgMonitorIndex >= 0 && fgMonitorIndex < g_monitorCount && fgMonitorIndex != cursorMonitorIndex) {
+                        g_monitorStates[fgMonitorIndex].lastInputTime = now;
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < g_monitorCount; i++) {
+            if (!g_monitorStates[i].enabled) continue;
+
+            int idleSeconds = (int)(now - g_monitorStates[i].lastInputTime);
+            int monitorHasMedia = usePerMonitorMedia ? mediaOnMonitor[i] : mediaPlaying;
+
+            if (!monitorHasMedia && idleSeconds >= g_app.config.idleTimeout) {
+                if (!g_monitorStates[i].screenSaverActive) {
+                    LogMessage("Timer: Activating screen saver on monitor %d (idle: %ds)", i, idleSeconds);
+                    ShowScreenSaverOnMonitor(i, 0);
+                }
+            } else if (g_monitorStates[i].screenSaverActive && !inManualCooldown) {
+                if (monitorHasMedia) {
+                    LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
+                    HideScreenSaverOnMonitor(i);
+                } else if (idleSeconds < IDLE_DEACTIVATE_THRESHOLD_SEC) {
+                    LogMessage("Timer: Deactivating screen saver on monitor %d (input detected)", i);
+                    HideScreenSaverOnMonitor(i);
+                }
+            }
+        }
+
+        if (!IsAnyMonitorActive()) {
+            g_app.screenSaverActive = 0;
+        }
+
+        POINT cursorPt;
+        GetCursorPos(&cursorPt);
+        int cursorMonitorIndex = GetMonitorIndexFromPoint(cursorPt);
+        int cursorOnActiveMonitor = (cursorMonitorIndex >= 0 && cursorMonitorIndex < g_monitorCount && g_monitorStates[cursorMonitorIndex].screenSaverActive);
+
+        if (cursorOnActiveMonitor) {
+            if (!g_app.cursorHidden) {
+                ShowCursor(FALSE);
+                g_app.cursorHidden = 1;
+                LogMessage("Cursor hidden");
+            }
+        } else {
+            if (g_app.cursorHidden) {
+                ShowCursor(TRUE);
+                g_app.cursorHidden = 0;
+                LogMessage("Cursor restored");
+            }
+        }
+
+        UpdateTrayIcon(IsAnyMonitorActive() ? 1 : 0);
+    } else {
+        // Global input detection mode:
+        //   A single idle timer (GetIdleTime) covers all monitors. When per-
+        //   monitor media detection is on, each monitor is still activated/
+        //   deactivated independently based on whether media is playing on it,
+        //   but idle time is global. Without per-monitor media, the original
+        //   all-on/all-off behavior is used.
+        DWORD idleTime = GetIdleTime();
+
+        if (g_app.config.perMonitorMediaDetection && g_app.config.mediaDetectionEnabled) {
+            // Per-monitor media with global input:
+            //   When idle beyond the timeout, activate the screen saver on
+            //   monitors without media and deactivate it on monitors where media
+            //   is detected. When the user is active, deactivate everything
+            //   (preserving the manual-activation cooldown logic).
+            int mediaOnMonitor[MAX_MONITOR_COUNT] = {0};
+            UpdateMediaMonitorStates(mediaOnMonitor);
+
+            if (idleTime > (DWORD)(g_app.config.idleTimeout * 1000)) {
+                for (int i = 0; i < g_monitorCount; i++) {
+                    if (!g_monitorStates[i].enabled) continue;
+
+                    if (mediaOnMonitor[i]) {
+                        if (g_monitorStates[i].screenSaverActive) {
+                            LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
+                            HideScreenSaverOnMonitor(i);
+                        }
+                    } else if (!g_monitorStates[i].screenSaverActive) {
+                        LogMessage("Timer: Activating screen saver on monitor %d (idle: %lums)", i, idleTime);
+                        ShowScreenSaverOnMonitor(i, 0);
+                    }
+                }
+
+                g_app.screenSaverActive = IsAnyMonitorActive() ? 1 : 0;
+
+                if (!g_app.screenSaverActive && g_app.cursorHidden) {
+                    ShowCursor(TRUE);
+                    g_app.cursorHidden = 0;
+                    LogMessage("Cursor restored (no active monitors)");
+                }
+
+                UpdateTrayIcon(g_app.screenSaverActive);
+            } else {
+                // User is active: deactivate everything (preserve manual cooldown logic)
+                if (g_app.screenSaverActive) {
+                    if (g_app.isManualActivation) {
+                        DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
+                        if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
+                            LogMessage("Timer: Skipping deactivation (manual cooldown: %lums/%dms)",
+                                     timeSinceActivation, MANUAL_ACTIVATION_COOLDOWN_MS);
+                        } else {
+                            if (idleTime < IDLE_DEACTIVATE_THRESHOLD_MS) {
+                                LogMessage("Timer: Deactivating screen saver (new input detected after cooldown)");
+                                HideScreenSaver();
+                                UpdateTrayIcon(0);
+                            }
+                        }
+                    } else {
+                        LogMessage("Timer: Deactivating screen saver (idle: %lums)", idleTime);
+                        HideScreenSaver();
+                        UpdateTrayIcon(0);
+                    }
+                }
+            }
+        } else {
+            // Original global behavior:
+            //   When idle beyond the timeout and no media is playing, activate
+            //   the screen saver on all enabled monitors at once. When the user
+            //   is active or media starts playing, deactivate everything.
+            //   Manual-activation cooldown logic is preserved.
+            int mediaPlaying = IsMediaPlaying();
+
+            if (!mediaPlaying && idleTime > (DWORD)(g_app.config.idleTimeout * 1000)) {
+                if (!g_app.screenSaverActive) {
+                    LogMessage("Timer: Activating screen saver (idle: %lums)", idleTime);
+                    ShowScreenSaver(0);
+                    UpdateTrayIcon(1);
+                }
+            } else {
+                if (g_app.screenSaverActive) {
+                    if (g_app.isManualActivation) {
+                        DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
+                        if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
+                            LogMessage("Timer: Skipping deactivation (manual cooldown: %lums/%dms)",
+                                     timeSinceActivation, MANUAL_ACTIVATION_COOLDOWN_MS);
+                        } else {
+                            if (idleTime < IDLE_DEACTIVATE_THRESHOLD_MS) {
+                                LogMessage("Timer: Deactivating screen saver (new input detected after cooldown)");
+                                HideScreenSaver();
+                                UpdateTrayIcon(0);
+                            }
+                        }
+                    } else {
+                        LogMessage("Timer: Deactivating screen saver (idle: %lums, media: %d)", idleTime, mediaPlaying);
+                        HideScreenSaver();
+                        UpdateTrayIcon(0);
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure screen saver windows stay on top (handles notifications like MS Teams)
+    if (IsAnyMonitorActive()) {
+        EnsureScreenSaverTopmost();
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == g_uTaskbarRestart && g_uTaskbarRestart != 0 && g_app.nid.cbSize != 0) {
         LogMessage("Taskbar recreated (Explorer restart) - restoring tray icon");
@@ -1954,279 +2308,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     switch (message) {
         case WM_CREATE:
-            memset(&g_app, 0, sizeof(g_app));
-            g_app.hWnd = hWnd;
-            g_app.isShuttingDown = 0;
-
-            g_hInstanceMutex = CreateMutexW(NULL, TRUE, L"OLEDAegis_SingleInstance");
-            if (GetLastError() == ERROR_ALREADY_EXISTS) {
-                MessageBoxW(NULL, L"OLED Aegis is already running", L"OLED Aegis", MB_OK | MB_ICONINFORMATION);
-                if (g_hInstanceMutex) {
-                    CloseHandle(g_hInstanceMutex);
-                    g_hInstanceMutex = NULL;
-                }
-                PostQuitMessage(0);
-                return -1;
-            }
-            // Keep mutex handle open for app lifetime to maintain single-instance lock
-
-            LoadTrayIcons();
-
-            g_app.nid.cbSize = sizeof(NOTIFYICONDATAA);
-            g_app.nid.hWnd = hWnd;
-            g_app.nid.uID = 1;
-            g_app.nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-            g_app.nid.uCallbackMessage = WM_TRAYICON;
-            g_app.nid.hIcon = g_hIconInactive;
-            lstrcpyA(g_app.nid.szTip, "OLED Aegis - Idle");
-            Shell_NotifyIconA(NIM_ADD, &g_app.nid);
-
-            g_app.config.idleTimeout = DEFAULT_IDLE_TIMEOUT;
-            g_app.config.checkInterval = 1000;
-            g_app.config.mediaDetectionEnabled = 1;
-            g_app.config.startupEnabled = 0;
-            g_app.config.debugMode = 0;
-            g_app.config.perMonitorInputDetection = 0;
-            g_app.config.perMonitorMediaDetection = 1;
-            for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
-                g_app.config.monitorsEnabled[i] = 1;
-            }
-
-            EnumerateMonitors();
-
-            for (int i = 0; i < g_monitorCount; i++) {
-                g_monitorStates[i].lastInputTime = time(NULL);
-                g_monitorStates[i].screenSaverActive = 0;
-                g_monitorStates[i].enabled = g_app.config.monitorsEnabled[i];
-            }
-
-            if (!ConfigFileExists()) {
-                SaveConfig();
-            }
-
-            LoadConfig();
-
-            for (int i = 0; i < g_monitorCount; i++) {
-                g_monitorStates[i].enabled = g_app.config.monitorsEnabled[i];
-            }
-
-            UpdateStartupRegistry();
-
-            LogMessage("Application started. Timeout: %ds, Media: %d, Debug: %d",
-                     g_app.config.idleTimeout, g_app.config.mediaDetectionEnabled, g_app.config.debugMode);
-
-            g_blackBrush = CreateSolidBrush(RGB(0, 0, 0));
-
-            WNDCLASSW wc = {0};
-            wc.lpfnWndProc = MonitorWindowProc;
-            wc.hInstance = GetModuleHandle(NULL);
-            wc.hbrBackground = g_blackBrush;
-            wc.lpszClassName = L"OLEDAegisScreen";
-            RegisterClassW(&wc);
-
-            SetTimer(hWnd, TIMER_IDLE_CHECK, g_app.config.checkInterval, NULL);
-
-            break;
+            return HandleCreation(hWnd);
 
         case WM_TIMER:
-            if (wParam == TIMER_IDLE_CHECK) {
-                // Skip all processing if no monitors have screen saver enabled
-                if (!IsAnyMonitorEnabled()) {
-                    break;
-                }
+            HandleTimeout(wParam);
+            break;
 
-                if (g_app.config.perMonitorInputDetection) {
-                    DWORD idleTime = GetIdleTime();
-                    time_t now = time(NULL);
-
-                    int usePerMonitorMedia = (g_app.config.perMonitorMediaDetection && g_app.config.mediaDetectionEnabled);
-                    int mediaOnMonitor[MAX_MONITOR_COUNT] = {0};
-                    int mediaPlaying = 0;
-                    if (usePerMonitorMedia) {
-                        UpdateMediaMonitorStates(mediaOnMonitor);
-                    } else {
-                        mediaPlaying = IsMediaPlaying();
-                    }
-
-                    int inManualCooldown = 0;
-                    if (g_app.isManualActivation) {
-                        DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
-                        if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
-                            inManualCooldown = 1;
-                        } else {
-                            g_app.isManualActivation = 0;
-                            g_app.manualActivationTime = 0;
-                        }
-                    }
-
-                    if (idleTime < IDLE_ACTIVITY_THRESHOLD_MS && !inManualCooldown) {
-                        POINT pt;
-                        GetCursorPos(&pt);
-                        int cursorMonitorIndex = GetMonitorIndexFromPoint(pt);
-
-                        if (cursorMonitorIndex >= 0 && cursorMonitorIndex < g_monitorCount) {
-                            g_monitorStates[cursorMonitorIndex].lastInputTime = now;
-                        }
-
-                        HWND hFg = GetForegroundWindow();
-                        if (hFg) {
-                            int isOledWindow = 0;
-                            for (int i = 0; i < g_monitorCount; i++) {
-                                if (g_monitorStates[i].hScreenSaverWnd == hFg) {
-                                    isOledWindow = 1;
-                                    break;
-                                }
-                            }
-
-                            if (!isOledWindow) {
-                                RECT rect;
-                                GetWindowRect(hFg, &rect);
-                                int fgMonitorIndex = GetMonitorIndexFromRect(rect);
-                                if (fgMonitorIndex >= 0 && fgMonitorIndex < g_monitorCount && fgMonitorIndex != cursorMonitorIndex) {
-                                    g_monitorStates[fgMonitorIndex].lastInputTime = now;
-                                }
-                            }
-                        }
-                    }
-
-                    for (int i = 0; i < g_monitorCount; i++) {
-                        if (!g_monitorStates[i].enabled) continue;
-
-                        int idleSeconds = (int)(now - g_monitorStates[i].lastInputTime);
-                        int monitorHasMedia = usePerMonitorMedia ? mediaOnMonitor[i] : mediaPlaying;
-
-                        if (!monitorHasMedia && idleSeconds >= g_app.config.idleTimeout) {
-                            if (!g_monitorStates[i].screenSaverActive) {
-                                LogMessage("Timer: Activating screen saver on monitor %d (idle: %ds)", i, idleSeconds);
-                                ShowScreenSaverOnMonitor(i, 0);
-                            }
-                        } else if (g_monitorStates[i].screenSaverActive && !inManualCooldown) {
-                            if (monitorHasMedia) {
-                                LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
-                                HideScreenSaverOnMonitor(i);
-                            } else if (idleSeconds < IDLE_DEACTIVATE_THRESHOLD_SEC) {
-                                LogMessage("Timer: Deactivating screen saver on monitor %d (input detected)", i);
-                                HideScreenSaverOnMonitor(i);
-                            }
-                        }
-                    }
-
-                    if (!IsAnyMonitorActive()) {
-                        g_app.screenSaverActive = 0;
-                    }
-
-                    POINT cursorPt;
-                    GetCursorPos(&cursorPt);
-                    int cursorMonitorIndex = GetMonitorIndexFromPoint(cursorPt);
-                    int cursorOnActiveMonitor = (cursorMonitorIndex >= 0 && cursorMonitorIndex < g_monitorCount && g_monitorStates[cursorMonitorIndex].screenSaverActive);
-
-                    if (cursorOnActiveMonitor) {
-                        if (!g_app.cursorHidden) {
-                            ShowCursor(FALSE);
-                            g_app.cursorHidden = 1;
-                            LogMessage("Cursor hidden");
-                        }
-                    } else {
-                        if (g_app.cursorHidden) {
-                            ShowCursor(TRUE);
-                            g_app.cursorHidden = 0;
-                            LogMessage("Cursor restored");
-                        }
-                    }
-
-                    UpdateTrayIcon(IsAnyMonitorActive() ? 1 : 0);
-                } else {
-                    DWORD idleTime = GetIdleTime();
-
-                    if (g_app.config.perMonitorMediaDetection && g_app.config.mediaDetectionEnabled) {
-                        // Per-monitor media: activate on monitors without media,
-                        // deactivate on monitors where media is detected.
-                        int mediaOnMonitor[MAX_MONITOR_COUNT] = {0};
-                        UpdateMediaMonitorStates(mediaOnMonitor);
-
-                        if (idleTime > (DWORD)(g_app.config.idleTimeout * 1000)) {
-                            for (int i = 0; i < g_monitorCount; i++) {
-                                if (!g_monitorStates[i].enabled) continue;
-
-                                if (mediaOnMonitor[i]) {
-                                    if (g_monitorStates[i].screenSaverActive) {
-                                        LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
-                                        HideScreenSaverOnMonitor(i);
-                                    }
-                                } else if (!g_monitorStates[i].screenSaverActive) {
-                                    LogMessage("Timer: Activating screen saver on monitor %d (idle: %lums)", i, idleTime);
-                                    ShowScreenSaverOnMonitor(i, 0);
-                                }
-                            }
-
-                            g_app.screenSaverActive = IsAnyMonitorActive() ? 1 : 0;
-
-                            if (!g_app.screenSaverActive && g_app.cursorHidden) {
-                                ShowCursor(TRUE);
-                                g_app.cursorHidden = 0;
-                                LogMessage("Cursor restored (no active monitors)");
-                            }
-
-                            UpdateTrayIcon(g_app.screenSaverActive);
-                        } else {
-                            // User is active: deactivate everything (preserve manual cooldown logic)
-                            if (g_app.screenSaverActive) {
-                                if (g_app.isManualActivation) {
-                                    DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
-                                    if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
-                                        LogMessage("Timer: Skipping deactivation (manual cooldown: %lums/%dms)",
-                                                 timeSinceActivation, MANUAL_ACTIVATION_COOLDOWN_MS);
-                                    } else {
-                                        if (idleTime < IDLE_DEACTIVATE_THRESHOLD_MS) {
-                                            LogMessage("Timer: Deactivating screen saver (new input detected after cooldown)");
-                                            HideScreenSaver();
-                                            UpdateTrayIcon(0);
-                                        }
-                                    }
-                                } else {
-                                    LogMessage("Timer: Deactivating screen saver (idle: %lums)", idleTime);
-                                    HideScreenSaver();
-                                    UpdateTrayIcon(0);
-                                }
-                            }
-                        }
-                    } else {
-                        int mediaPlaying = IsMediaPlaying();
-
-                        if (!mediaPlaying && idleTime > (DWORD)(g_app.config.idleTimeout * 1000)) {
-                            if (!g_app.screenSaverActive) {
-                                LogMessage("Timer: Activating screen saver (idle: %lums)", idleTime);
-                                ShowScreenSaver(0);
-                                UpdateTrayIcon(1);
-                            }
-                        } else {
-                            if (g_app.screenSaverActive) {
-                                if (g_app.isManualActivation) {
-                                    DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
-                                    if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
-                                        LogMessage("Timer: Skipping deactivation (manual cooldown: %lums/%dms)",
-                                                 timeSinceActivation, MANUAL_ACTIVATION_COOLDOWN_MS);
-                                    } else {
-                                        if (idleTime < IDLE_DEACTIVATE_THRESHOLD_MS) {
-                                            LogMessage("Timer: Deactivating screen saver (new input detected after cooldown)");
-                                            HideScreenSaver();
-                                            UpdateTrayIcon(0);
-                                        }
-                                    }
-                                } else {
-                                    LogMessage("Timer: Deactivating screen saver (idle: %lums, media: %d)", idleTime, mediaPlaying);
-                                    HideScreenSaver();
-                                    UpdateTrayIcon(0);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Ensure screen saver windows stay on top (handles notifications like MS Teams)
-                if (IsAnyMonitorActive()) {
-                    EnsureScreenSaverTopmost();
-                }
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMRESUMESUSPEND || wParam == PBT_APMRESUMEAUTOMATIC) {
+                LogMessage("System resumed from sleep - resetting media detection cache");
+                ResetMediaDetectionCache();
             }
             break;
 
