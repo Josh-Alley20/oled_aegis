@@ -70,7 +70,7 @@ DEFINE_GUID(IID_IAudioMeterInformation,   0xC02216F6, 0x8C67, 0x4B5B, 0x9D, 0x00
 #define MIN_MEDIA_WINDOW_OVERLAP_RATIO  0.10    // Ignore thin window-border overlap onto adjacent monitors
 #define MEDIA_DETECTION_CACHE_MS        2000    // Cache media-window scans to keep timer work light
 #define AUDIO_ACTIVE_PEAK_THRESHOLD     0.0001f // Ignore paused/silent sessions that remain "active"
-#define AUDIO_GRACE_PERIOD_MS           10000   // Keep media state during brief audio silence (quiet passages)
+#define AUDIO_GRACE_PERIOD_MS           30000   // Keep media state during brief audio silence (quiet passages)
 #define CURSOR_COUNTER_MAX_ATTEMPTS     16      // Safety bound when normalizing ShowCursor's counter
 #define TOPMOST_REFRESH_INTERVAL_MS     5000    // Reassert topmost occasionally, not every timer tick
 #define MAX_ACTIVE_AUDIO_PIDS           64      // Upper bound on concurrently active audio sessions we track
