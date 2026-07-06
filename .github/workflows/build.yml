@@ -10,6 +10,15 @@ on:
       - 'build.ps1'
       - 'build.sh'
       - '.github/workflows/build.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'build.bat'
+      - 'build.ps1'
+      - 'build.sh'
+      - '.github/workflows/build.yml'
 
 jobs:
   build:
@@ -26,7 +35,7 @@ jobs:
       - name: Build project
         shell: cmd
         run: |
-          build.bat
+          call build.bat
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
