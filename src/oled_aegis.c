@@ -53,6 +53,7 @@ DEFINE_GUID(IID_IAudioMeterInformation,   0xC02216F6, 0x8C67, 0x4B5B, 0x9D, 0x00
 #define IDC_PERMONITOR_MEDIA_CHECK  1011
 #define IDC_MUTED_MEDIA_CHECK       1012
 #define IDC_PIXELSHIFT_EDIT         1010
+#define IDC_IGNORE_MOUSE_CHECK      1013
 #define IDC_MONITOR_BASE            2000  // Monitor checkboxes: IDC_MONITOR_BASE + index
 
 // Tray context menu command IDs
@@ -132,6 +133,7 @@ typedef struct {
     int screenSaverActive;
     int enabled;
     HWND hScreenSaverWnd;
+    int mouseInputAllowed;  // Set when another monitor has already woken (per-monitor + ignoreMouseInput mode)
 } MonitorState;
 
 typedef struct {
@@ -146,6 +148,7 @@ typedef struct {
     int perMonitorMediaDetection;
     int blockOnMutedMedia;
     int pixelShiftCompensation;
+    int ignoreMouseInput;
 } Config;
 
 typedef struct {
@@ -163,6 +166,33 @@ typedef struct {
 
 static AppState g_app;
 static HANDLE g_hInstanceMutex = NULL;  // Single-instance mutex (kept for app lifetime)
+static DWORD g_lastKeyboardInputTime = 0;  // Tick count of last keyboard input detected via low-level hook (0 = never)
+static HHOOK g_hKeyboardHook = NULL;      // Low-level keyboard hook, installed only while screen saver is active
+
+// Low-level keyboard hook proc. Fires for all key-down events system-wide.
+// Sets g_lastKeyboardInputTime so the timer can detect keyboard input even
+// though the screen saver window never receives focus or WM_KEYDOWN.
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+        g_lastKeyboardInputTime = GetTickCount();
+    }
+    return CallNextHookEx(g_hKeyboardHook, nCode, wParam, lParam);
+}
+
+void InstallKeyboardHook() {
+    if (!g_hKeyboardHook) {
+        g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+        LogMessage("Keyboard hook %s", g_hKeyboardHook ? "installed" : "FAILED to install");
+    }
+}
+
+void UninstallKeyboardHook() {
+    if (g_hKeyboardHook) {
+        UnhookWindowsHookEx(g_hKeyboardHook);
+        g_hKeyboardHook = NULL;
+        LogMessage("Keyboard hook uninstalled");
+    }
+}
 
 static UINT g_settingsDpi = 96;
 static HBRUSH g_blackBrush = NULL;
@@ -199,6 +229,7 @@ void ClampConfigValues() {
     g_app.config.perMonitorInputDetection = g_app.config.perMonitorInputDetection ? 1 : 0;
     g_app.config.perMonitorMediaDetection = g_app.config.perMonitorMediaDetection ? 1 : 0;
     g_app.config.blockOnMutedMedia = g_app.config.blockOnMutedMedia ? 1 : 0;
+    g_app.config.ignoreMouseInput  = g_app.config.ignoreMouseInput  ? 1 : 0;
 }
 
 int IsAppUiActive() {
@@ -578,12 +609,35 @@ LRESULT CALLBACK MonitorWindowProc(HWND hWnd, UINT message, WPARAM wParam, LPARA
         case WM_LBUTTONDOWN:
         case WM_RBUTTONDOWN:
         case WM_MBUTTONDOWN:
+            if (g_app.config.ignoreMouseInput) {
+                break;  // Mouse clicks do not dismiss the screen saver when this option is on
+            }
+            if (GetTickCount() < ignoreInputUntil) {
+                break;
+            }
+            LogMessage("Input detected on monitor window (mouse click, msg: %u)", message);
+            if (g_app.config.perMonitorInputDetection) {
+                for (int i = 0; i < g_monitorCount; i++) {
+                    if (g_monitorStates[i].hScreenSaverWnd == hWnd) {
+                        HideScreenSaverOnMonitor(i);
+                        break;
+                    }
+                }
+                if (!IsAnyMonitorActive()) {
+                    g_app.screenSaverActive = 0;
+                }
+                UpdateTrayIcon(IsAnyMonitorActive() ? 1 : 0);
+            } else {
+                HideScreenSaver();
+                UpdateTrayIcon(0);
+            }
+            break;
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN:
             if (GetTickCount() < ignoreInputUntil) {
                 break;
             }
-            LogMessage("Input detected on monitor window (msg: %u)", message);
+            LogMessage("Input detected on monitor window (key press, msg: %u)", message);
             if (g_app.config.perMonitorInputDetection) {
                 for (int i = 0; i < g_monitorCount; i++) {
                     if (g_monitorStates[i].hScreenSaverWnd == hWnd) {
@@ -667,6 +721,8 @@ void LoadConfig() {
                     g_app.config.blockOnMutedMedia = atoi(value);
                 } else if (strcmp(key, "pixelShiftCompensation") == 0) {
                     g_app.config.pixelShiftCompensation = atoi(value);
+                } else if (strcmp(key, "ignoreMouseInput") == 0) {
+                    g_app.config.ignoreMouseInput = atoi(value);
                 } else if (strncmp(key, "monitorEnabled_", 15) == 0) {
                     const char* identifier = key + 15;
                     hadMonitorConfig = 1;
@@ -735,6 +791,7 @@ void SaveConfig() {
         fprintf(f, "perMonitorMediaDetection=%d\n", g_app.config.perMonitorMediaDetection);
         fprintf(f, "blockOnMutedMedia=%d\n", g_app.config.blockOnMutedMedia);
         fprintf(f, "pixelShiftCompensation=%d\n", g_app.config.pixelShiftCompensation);
+        fprintf(f, "ignoreMouseInput=%d\n", g_app.config.ignoreMouseInput);
         // Save monitor settings using persistent device path as key, with comment showing friendly name
         for (int i = 0; i < g_monitorCount; i++) {
             fprintf(f, "monitorEnabled_%s=%d ; %s\n",
@@ -844,6 +901,23 @@ void HideScreenSaverOnMonitor(int monitorIndex) {
 
     g_monitorStates[monitorIndex].screenSaverActive = 0;
     g_monitorStates[monitorIndex].lastInputTime = time(NULL);
+
+    // If ignoreMouseInput is on and another monitor is still sleeping, allow
+    // mouse input to wake those remaining monitors now that one is already awake.
+    if (g_app.config.ignoreMouseInput && g_app.config.perMonitorInputDetection) {
+        for (int i = 0; i < g_monitorCount; i++) {
+            if (g_monitorStates[i].screenSaverActive) {
+                g_monitorStates[i].mouseInputAllowed = 1;
+                LogMessage("Mouse input now allowed on monitor %d (another monitor woke)", i);
+            }
+        }
+    }
+
+    // Uninstall keyboard hook when last monitor deactivates
+    if (!IsAnyMonitorActive()) {
+        UninstallKeyboardHook();
+        g_lastKeyboardInputTime = 0;
+    }
 }
 
 void EnumerateMonitors() {
@@ -1658,11 +1732,13 @@ void ShowScreenSaverOnMonitor(int monitorIndex, int isManual) {
         }
     }
 
+    // Reset per-monitor mouse-allowed flag — requires fresh keyboard input to wake this monitor
+    g_monitorStates[monitorIndex].mouseInputAllowed = 0;
+
     if (g_monitorStates[monitorIndex].hScreenSaverWnd) {
         // Reposition and resize in case the pixel shift compensation setting changed since the
         // window was last created.
-        LONG_PTR exStyle = GetWindowLongPtrW(g_monitorStates[monitorIndex].hScreenSaverWnd, GWL_EXSTYLE);
-        if ((exStyle & WS_EX_NOACTIVATE) == 0) {
+        LONG_PTR exStyle = GetWindowLongPtrW(g_monitorStates[monitorIndex].hScreenSaverWnd, GWL_EXSTYLE);        if ((exStyle & WS_EX_NOACTIVATE) == 0) {
             SetWindowLongPtrW(g_monitorStates[monitorIndex].hScreenSaverWnd, GWL_EXSTYLE, exStyle | WS_EX_NOACTIVATE);
         }
         int pad = g_app.config.pixelShiftCompensation;
@@ -1701,6 +1777,12 @@ void ShowScreenSaverOnMonitor(int monitorIndex, int isManual) {
 
     if (!g_app.config.perMonitorInputDetection) {
         HideCursorForScreenSaver("screen saver activation");
+    }
+
+    // Install the low-level keyboard hook on first monitor activation (if ignoreMouseInput is on)
+    if (g_app.config.ignoreMouseInput && !g_hKeyboardHook) {
+        g_lastKeyboardInputTime = 0;
+        InstallKeyboardHook();
     }
 }
 
@@ -1759,6 +1841,11 @@ void ShowScreenSaver(int isManual) {
 
     LogMessage("Activated screen saver on %d monitors", windowsCreated);
 
+    if (windowsCreated > 0 && g_app.config.ignoreMouseInput) {
+        g_lastKeyboardInputTime = 0;  // Clear stale timestamp before installing hook
+        InstallKeyboardHook();
+    }
+
     g_app.screenSaverActive = 1;
 }
 
@@ -1776,6 +1863,8 @@ void HideScreenSaver() {
     g_app.screenSaverActive = 0;
     g_app.manualActivationTime = 0;
     g_app.isManualActivation = 0;
+    g_lastKeyboardInputTime = 0;  // Reset so next activation requires fresh keyboard input
+    UninstallKeyboardHook();
 
     EnsureCursorVisible("screen saver hidden");
 }
@@ -1988,6 +2077,11 @@ void ShowSettingsDialog() {
                      margin, y, checkboxWidth, controlHeight, g_hSettingsDialog, (HMENU)IDC_MUTED_MEDIA_CHECK, hMod, NULL);
         y += rowHeight + ScaleDPI(5);
 
+        HWND hIgnoreMouseCheck = CreateWindowA("BUTTON", "Ignore Mouse Input",
+                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                     margin, y, checkboxWidth, controlHeight, g_hSettingsDialog, (HMENU)IDC_IGNORE_MOUSE_CHECK, hMod, NULL);
+        y += rowHeight + ScaleDPI(5);
+
         HWND hMonitorsLabel = CreateWindowA("STATIC", "Monitors:",
                      WS_CHILD | WS_VISIBLE,
                      margin, y, ScaleDPI(100), controlHeight, g_hSettingsDialog, NULL, hMod, NULL);
@@ -2046,6 +2140,7 @@ void ShowSettingsDialog() {
             SendMessageA(hPerMonitorCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPerMonitorMediaCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hMutedMediaCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
+            SendMessageA(hIgnoreMouseCheck, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPixelShiftLabel, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPixelShiftEdit, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
             SendMessageA(hPixelShiftUpDown, WM_SETFONT, (WPARAM)g_hSettingsFont, TRUE);
@@ -2072,6 +2167,8 @@ void ShowSettingsDialog() {
                    "Detect media playback per monitor instead of globally. Only blocks the screen saver on the monitor where media is actually playing, so playback on a non-OLED display won't keep the OLED awake.");
         AddTooltip(g_hSettingsDialog, hMutedMediaCheck,
                    "Block the screen saver even when media is muted or inaudible (e.g. muted video, OBS replay buffer). When off, only audible media prevents the screen saver.");
+        AddTooltip(g_hSettingsDialog, hIgnoreMouseCheck,
+                   "Does not account for mouse input when screen saver is on");
         AddTooltip(g_hSettingsDialog, hPixelShiftEdit,
                    "Expand the screen saver window beyond the monitor bounds by this many pixels on each side. "
                    "Use 4-8 on QD-OLED panels (e.g. Alienware) to prevent hardware pixel shift from exposing the desktop edge. (0 = disabled)");
@@ -2090,6 +2187,7 @@ void ShowSettingsDialog() {
         CheckDlgButton(g_hSettingsDialog, IDC_PERMONITOR_CHECK, g_app.config.perMonitorInputDetection ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(g_hSettingsDialog, IDC_PERMONITOR_MEDIA_CHECK, g_app.config.perMonitorMediaDetection ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(g_hSettingsDialog, IDC_MUTED_MEDIA_CHECK, g_app.config.blockOnMutedMedia ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(g_hSettingsDialog, IDC_IGNORE_MOUSE_CHECK, g_app.config.ignoreMouseInput ? BST_CHECKED : BST_UNCHECKED);
 
         sprintf_s(buffer, 32, "%d", g_app.config.pixelShiftCompensation);
         SetDlgItemTextA(g_hSettingsDialog, IDC_PIXELSHIFT_EDIT, buffer);
@@ -2126,6 +2224,7 @@ void ApplySettings(HWND hWnd) {
     g_app.config.perMonitorInputDetection = IsDlgButtonChecked(hWnd, IDC_PERMONITOR_CHECK) == BST_CHECKED;
     g_app.config.perMonitorMediaDetection = IsDlgButtonChecked(hWnd, IDC_PERMONITOR_MEDIA_CHECK) == BST_CHECKED;
     g_app.config.blockOnMutedMedia = IsDlgButtonChecked(hWnd, IDC_MUTED_MEDIA_CHECK) == BST_CHECKED;
+    g_app.config.ignoreMouseInput  = IsDlgButtonChecked(hWnd, IDC_IGNORE_MOUSE_CHECK) == BST_CHECKED;
 
     GetDlgItemTextA(hWnd, IDC_PIXELSHIFT_EDIT, buffer, 32);
     g_app.config.pixelShiftCompensation = atoi(buffer);
@@ -2364,8 +2463,16 @@ void HandleTimeout(WPARAM wParam) {
                     LogMessage("Timer: Deactivating screen saver on monitor %d (media detected)", i);
                     HideScreenSaverOnMonitor(i);
                 } else if (idleSeconds < IDLE_DEACTIVATE_THRESHOLD_SEC) {
-                    LogMessage("Timer: Deactivating screen saver on monitor %d (input detected)", i);
-                    HideScreenSaverOnMonitor(i);
+                    // When ignoreMouseInput is on, only deactivate on keyboard input —
+                    // unless mouseInputAllowed is set (another monitor already woke via keyboard).
+                    int inputActive = !g_app.config.ignoreMouseInput ||
+                                      g_monitorStates[i].mouseInputAllowed ||
+                                      (g_lastKeyboardInputTime != 0 &&
+                                       (GetTickCount() - g_lastKeyboardInputTime) < IDLE_DEACTIVATE_THRESHOLD_MS);
+                    if (inputActive) {
+                        LogMessage("Timer: Deactivating screen saver on monitor %d (input detected)", i);
+                        HideScreenSaverOnMonitor(i);
+                    }
                 }
             }
         }
@@ -2431,7 +2538,13 @@ void HandleTimeout(WPARAM wParam) {
             } else {
                 // User is active: deactivate everything (preserve manual cooldown logic)
                 if (g_app.screenSaverActive) {
-                    if (g_app.isManualActivation) {
+                    // When ignoreMouseInput is on, only keyboard input should wake the screen saver
+                    int inputActive = !g_app.config.ignoreMouseInput ||
+                                      (g_lastKeyboardInputTime != 0 &&
+                                       (GetTickCount() - g_lastKeyboardInputTime) < IDLE_DEACTIVATE_THRESHOLD_MS);
+                    if (!inputActive) {
+                        // Mouse movement only; stay asleep
+                    } else if (g_app.isManualActivation) {
                         DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
                         if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
                             LogMessage("Timer: Skipping deactivation (manual cooldown: %lums/%dms)",
@@ -2466,7 +2579,13 @@ void HandleTimeout(WPARAM wParam) {
                 }
             } else {
                 if (g_app.screenSaverActive) {
-                    if (g_app.isManualActivation) {
+                    // When ignoreMouseInput is on, only keyboard input should wake the screen saver
+                    int inputActive = !g_app.config.ignoreMouseInput ||
+                                      (g_lastKeyboardInputTime != 0 &&
+                                       (GetTickCount() - g_lastKeyboardInputTime) < IDLE_DEACTIVATE_THRESHOLD_MS);
+                    if (!inputActive) {
+                        // Mouse movement only; stay asleep
+                    } else if (g_app.isManualActivation) {
                         DWORD timeSinceActivation = GetTickCount() - g_app.manualActivationTime;
                         if (timeSinceActivation < MANUAL_ACTIVATION_COOLDOWN_MS) {
                             LogMessage("Timer: Skipping deactivation (manual cooldown: %lums/%dms)",
@@ -2626,6 +2745,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case WM_DESTROY:
             LogMessage("Application shutting down");
 
+            UninstallKeyboardHook();
             EnsureCursorVisible("shutdown");
 
             for (int i = 0; i < MAX_MONITOR_COUNT; i++) {
